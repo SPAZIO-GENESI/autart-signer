@@ -16,6 +16,15 @@ on:
       - main
   workflow_dispatch:
 
+# Un solo deploy alla volta su questo App Service: senza, push ravvicinati
+# innescano run paralleli che si scontrano sull'endpoint OneDeploy di Kudu
+# (409 Conflict) e possono lasciare il sito giù per qualche minuto —
+# successo il 13/08/2026, vedi p43-piano-2026/STATO.md. cancel-in-progress
+# resta false: mai interrompere un deploy Azure a metà, solo accodare.
+concurrency:
+  group: deploy-sgart
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -69,7 +78,7 @@ jobs:
 
     steps:
       - name: Download artifact from build job
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: python-app
       
