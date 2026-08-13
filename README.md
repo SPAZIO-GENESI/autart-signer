@@ -1,5 +1,7 @@
 # authart — firma crittografica dei certificati PDF
 
+[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/SPAZIO-GENESI/autart-signer/badge)](https://scorecard.dev/viewer/?uri=github.com/SPAZIO-GENESI/autart-signer)
+
 Servizio di firma del sistema di attestazione opere digitali di Spazio Genesi ETS.
 Riceve un PDF e lo restituisce firmato **PAdES B-LT**: firma CMS detached con
 certificato PKCS#12, **marca temporale RFC 3161** da TSA con radice in Adobe AATL
