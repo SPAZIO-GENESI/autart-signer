@@ -1,4 +1,4 @@
-from flask import Flask, request, Response
+from flask import Flask, request, Response, jsonify
 from pyhanko.sign import signers
 from pyhanko.sign.fields import SigFieldSpec, SigSeedSubFilter
 from pyhanko.sign.signers import PdfSigner
@@ -13,7 +13,7 @@ import tempfile
 app = Flask(__name__)
 
 # Versione del signer: sorgente di verità unica (vedi CLAUDE.md › Versioning). Esposta da GET /.
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 
 P12_PASSWORD = os.environ.get("P12_PASSWORD")
 SIGN_SECRET  = os.environ.get("SIGN_SECRET")
@@ -21,6 +21,28 @@ SIGN_SECRET  = os.environ.get("SIGN_SECRET")
 # TSA RFC 3161 con radice in AATL: la marca temporale risulta attendibile in Adobe
 # Reader anche se il certificato firmatario resta self-signed. Vuota = nessun timestamp.
 TSA_URL = os.environ.get("TSA_URL", "http://timestamp.digicert.com")
+
+# Credenziali per una TSA che le richieda (le qualificate a lotti quasi sempre lo
+# fanno). HTTPTimeStamper accetta già `auth` come tupla basic: qui la si costruisce
+# solo se entrambe le variabili sono presenti, così il comportamento di default
+# resta identico a prima.
+TSA_USER = os.environ.get("TSA_USER")
+TSA_PASSWORD = os.environ.get("TSA_PASSWORD")
+TSA_AUTH = (TSA_USER, TSA_PASSWORD) if TSA_USER and TSA_PASSWORD else None
+
+# Livello dichiarato della marca temporale. NON è dedotto: è una dichiarazione di
+# configurazione, che va messa a "true" SOLO dopo aver verificato sul token reale
+# (img-auth-hub/tools/inspect_sig.py) che l'emittente sia iscritto alla EU Trusted
+# List e che il token porti i QCStatements ETSI. Al 10/09/2026 la TSA in uso
+# (timestamp.digicert.com) è AATL ma NON qualificata eIDAS: resta "false".
+TSA_QUALIFIED = os.environ.get("TSA_QUALIFIED", "").strip().lower() in ("1", "true", "yes")
+
+def _tsa_host(url):
+    """Host della TSA, per dichiararlo senza esporre eventuali credenziali nell'URL."""
+    if not url:
+        return None
+    without_scheme = url.split("://", 1)[-1]
+    return without_scheme.split("/", 1)[0].split("@")[-1]
 
 # Supporta sia P12_BASE64 (priorità, cert inline nell'env) sia P12_PATH (file su disco)
 _p12_base64 = os.environ.get("P12_BASE64")
@@ -34,7 +56,28 @@ else:
 
 @app.route("/", methods=["GET"])
 def health():
+    # Formato invariato (testo, "Signer OK vX.Y.Z"): è ciò che /api/status di
+    # imgauth e la scheda versioni si aspettano. Lo stato della marca temporale
+    # vive su /status, per non cambiare questo contratto.
     return f"Signer OK v{APP_VERSION}"
+
+
+@app.route("/status", methods=["GET"])
+def status():
+    """Cosa questo signer è configurato per fare, prima di riceverne la prova.
+
+    Serve a imgauth: il certificato PDF viene composto PRIMA della firma, quindi
+    per stampare il livello di marca temporale bisogna saperlo in anticipo. Dopo
+    la firma l'esito reale torna negli header di /sign, e chi ha stampato una
+    riga diversa la corregge. Nessun segreto qui: solo host e livello dichiarato.
+    """
+    return jsonify({
+        "version": APP_VERSION,
+        "timestamp_configured": bool(TSA_URL),
+        "timestamp_host": _tsa_host(TSA_URL),
+        "timestamp_level": ("qualified" if TSA_QUALIFIED else "recognized") if TSA_URL else "none",
+        "timestamp_auth": bool(TSA_AUTH),
+    })
 
 @app.route("/sign", methods=["POST"])
 def sign():
@@ -84,9 +127,17 @@ def sign():
             pdf_signer.sign_pdf(IncrementalPdfFileWriter(io.BytesIO(pdf)), output=output)
             return output.getvalue()
 
+        # Esito effettivo della marca temporale, dichiarato al chiamante negli
+        # header. Il fail-open resta la politica di emissione (meglio un
+        # certificato senza marca che nessun certificato), ma smette di essere
+        # muto: chi stampa il certificato deve poter dire il vero su cosa
+        # contiene. Vedi P55 §M7.
+        timestamp_applied = False
+
         if TSA_URL:
             try:
-                signed_pdf = do_sign(HTTPTimeStamper(TSA_URL), with_ltv=True)
+                signed_pdf = do_sign(HTTPTimeStamper(TSA_URL, auth=TSA_AUTH), with_ltv=True)
+                timestamp_applied = True
             except Exception:
                 # fail-open: un disservizio di TSA/OCSP/CRL non deve bloccare l'emissione
                 import traceback
@@ -100,4 +151,14 @@ def sign():
         traceback.print_exc()
         return Response(f"Signing error: {str(e)}", status=500)
 
-    return Response(signed_pdf, mimetype="application/pdf")
+    if timestamp_applied:
+        level = "qualified" if TSA_QUALIFIED else "recognized"
+    else:
+        level = "none"
+
+    return Response(signed_pdf, mimetype="application/pdf", headers={
+        "X-Sign-Timestamp": "applied" if timestamp_applied else "absent",
+        "X-Sign-Timestamp-Level": level,
+        "X-Sign-Timestamp-Host": _tsa_host(TSA_URL) or "",
+        "X-Sign-Version": APP_VERSION,
+    })
